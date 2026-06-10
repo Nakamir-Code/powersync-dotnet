@@ -143,7 +143,8 @@ internal sealed class SyncingService(
         {
             ct.ThrowIfCancellationRequested();
 
-            Attachment? changed = attachment.State switch
+            var snapshotState = attachment.State;
+            Attachment? changed = snapshotState switch
             {
                 AttachmentState.QueuedUpload => await UploadAttachmentAsync(attachment),
                 AttachmentState.QueuedDownload => await DownloadAttachmentAsync(attachment),
@@ -156,7 +157,7 @@ internal sealed class SyncingService(
                 await attachmentService.WithContextAsync(async ctx =>
                 {
                     var current = await ctx.GetAttachmentAsync(attachment.Id);
-                    if (current?.State == attachment.State)
+                    if (current?.State == snapshotState)
                     {
                         await ctx.SaveAttachmentsAsync([changed]);
                     }
@@ -253,6 +254,10 @@ internal sealed class SyncingService(
         try
         {
             await remoteStorage.DeleteFileAsync(attachment);
+            if (attachment.LocalUri is not null)
+            {
+                await localStorage.DeleteFileAsync(attachment.LocalUri);
+            }
 
             await attachmentService.WithContextAsync(async ctx =>
             {
@@ -260,11 +265,6 @@ internal sealed class SyncingService(
                 if (current?.State != AttachmentState.QueuedDelete)
                 {
                     return;
-                }
-
-                if (attachment.LocalUri is not null)
-                {
-                    await localStorage.DeleteFileAsync(attachment.LocalUri);
                 }
 
                 await ctx.DeleteAttachmentAsync(attachment.Id);
