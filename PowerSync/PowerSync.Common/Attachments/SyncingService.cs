@@ -113,40 +113,36 @@ internal sealed class SyncingService(
     /// Runs one sync pass: fetches active attachments, processes them, then prunes archived rows.
     /// </summary>
     /// <returns>A task that completes when the pass has finished.</returns>
-    public Task RunSyncPassAsync() => attachmentService.WithContextAsync(async ctx =>
+    public async Task RunSyncPassAsync()
     {
-        var active = await ctx.GetActiveAttachmentsAsync();
-        await ProcessAttachmentsAsync(active, ctx);
-        await DeleteArchivedAttachmentsAsync(ctx);
-    });
+        var active = await attachmentService.WithContextAsync(ctx => ctx.GetActiveAttachmentsAsync());
+        await ProcessAttachmentsAsync(active);
+        await attachmentService.WithContextAsync(ctx => DeleteArchivedAttachmentsAsync(ctx));
+    }
 
     /// <summary>
-    /// Processes attachments based on their state. Updates are saved in a single batch.
+    /// Processes attachments based on their state. Each state change is persisted as soon as its
+    /// transfer completes.
     /// </summary>
     /// <param name="attachments">Attachment records to process.</param>
-    /// <param name="context">Attachment context for database operations.</param>
-    /// <returns>A task that completes once all attachments have been processed and saved.</returns>
-    public async Task ProcessAttachmentsAsync(IReadOnlyList<Attachment> attachments, AttachmentContext context)
+    /// <returns>A task that completes once all attachments have been processed.</returns>
+    public async Task ProcessAttachmentsAsync(IReadOnlyList<Attachment> attachments)
     {
-        var updates = new List<Attachment>();
-
         foreach (var attachment in attachments)
         {
             Attachment? changed = attachment.State switch
             {
                 AttachmentState.QueuedUpload => await UploadAttachmentAsync(attachment),
                 AttachmentState.QueuedDownload => await DownloadAttachmentAsync(attachment),
-                AttachmentState.QueuedDelete => await DeleteAttachmentAsync(attachment, context),
+                AttachmentState.QueuedDelete => await DeleteAttachmentAsync(attachment),
                 _ => null,
             };
 
             if (changed is not null)
             {
-                updates.Add(changed);
+                await attachmentService.WithContextAsync(ctx => ctx.SaveAttachmentsAsync([changed]));
             }
         }
-
-        await context.SaveAttachmentsAsync(updates);
     }
 
     /// <summary>
@@ -231,9 +227,8 @@ internal sealed class SyncingService(
     /// On failure, defers to <see cref="IAttachmentErrorHandler"/> or archives.
     /// </summary>
     /// <param name="attachment">The attachment to delete.</param>
-    /// <param name="context">The attachment context for database operations.</param>
     /// <returns>The archived attachment, or <c>null</c> on success or retry.</returns>
-    public async Task<Attachment?> DeleteAttachmentAsync(Attachment attachment, AttachmentContext context)
+    public async Task<Attachment?> DeleteAttachmentAsync(Attachment attachment)
     {
         try
         {
@@ -243,7 +238,7 @@ internal sealed class SyncingService(
                 await localStorage.DeleteFileAsync(attachment.LocalUri);
             }
 
-            await context.DeleteAttachmentAsync(attachment.Id);
+            await attachmentService.WithContextAsync(ctx => ctx.DeleteAttachmentAsync(attachment.Id));
             return null;
         }
         catch (Exception error)
