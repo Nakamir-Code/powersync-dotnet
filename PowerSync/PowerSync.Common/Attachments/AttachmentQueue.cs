@@ -122,8 +122,9 @@ public sealed class AttachmentQueue : IAsyncDisposable
     /// called manually to await an immediate sync pass (e.g. before shutting down). For
     /// "fire and forget", use <see cref="TriggerSync"/>.
     /// </remarks>
+    /// <param name="ct">The cancellation token observed between records.</param>
     /// <returns>A task that completes when the sync pass has finished.</returns>
-    public Task SyncStorageAsync() => _syncingService.RunSyncPassAsync();
+    public Task SyncStorageAsync(CancellationToken ct = default) => _syncingService.RunSyncPassAsync(ct);
 
     /// <summary>
     /// Stops the attachment synchronization process. Cancels the sync pipeline, stops the periodic
