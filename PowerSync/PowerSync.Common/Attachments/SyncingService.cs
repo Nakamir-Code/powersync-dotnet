@@ -22,6 +22,7 @@ internal sealed class SyncingService(
     ILogger logger)
 {
     private readonly SemaphoreSlim _startStopLock = new(1, 1);
+    private readonly SemaphoreSlim _syncPassLock = new(1, 1);
     private CancellationTokenSource? _internalCts;
     private Channel<bool>? _syncSignals;
 
@@ -112,12 +113,21 @@ internal sealed class SyncingService(
     /// <summary>
     /// Runs one sync pass: fetches active attachments, processes them, then prunes archived rows.
     /// </summary>
+    /// <param name="ct">The cancellation token observed between records.</param>
     /// <returns>A task that completes when the pass has finished.</returns>
-    public async Task RunSyncPassAsync()
+    public async Task RunSyncPassAsync(CancellationToken ct = default)
     {
-        var active = await attachmentService.WithContextAsync(ctx => ctx.GetActiveAttachmentsAsync());
-        await ProcessAttachmentsAsync(active);
-        await attachmentService.WithContextAsync(ctx => DeleteArchivedAttachmentsAsync(ctx));
+        await _syncPassLock.WaitAsync(ct);
+        try
+        {
+            var active = await attachmentService.WithContextAsync(ctx => ctx.GetActiveAttachmentsAsync());
+            await ProcessAttachmentsAsync(active, ct);
+            await attachmentService.WithContextAsync(ctx => DeleteArchivedAttachmentsAsync(ctx));
+        }
+        finally
+        {
+            _syncPassLock.Release();
+        }
     }
 
     /// <summary>
@@ -125,11 +135,14 @@ internal sealed class SyncingService(
     /// transfer completes.
     /// </summary>
     /// <param name="attachments">Attachment records to process.</param>
+    /// <param name="ct">The cancellation token observed between records.</param>
     /// <returns>A task that completes once all attachments have been processed.</returns>
-    public async Task ProcessAttachmentsAsync(IReadOnlyList<Attachment> attachments)
+    public async Task ProcessAttachmentsAsync(IReadOnlyList<Attachment> attachments, CancellationToken ct = default)
     {
         foreach (var attachment in attachments)
         {
+            ct.ThrowIfCancellationRequested();
+
             Attachment? changed = attachment.State switch
             {
                 AttachmentState.QueuedUpload => await UploadAttachmentAsync(attachment),
@@ -140,7 +153,14 @@ internal sealed class SyncingService(
 
             if (changed is not null)
             {
-                await attachmentService.WithContextAsync(ctx => ctx.SaveAttachmentsAsync([changed]));
+                await attachmentService.WithContextAsync(async ctx =>
+                {
+                    var current = await ctx.GetAttachmentAsync(attachment.Id);
+                    if (current?.State == attachment.State)
+                    {
+                        await ctx.SaveAttachmentsAsync([changed]);
+                    }
+                });
             }
         }
     }
@@ -233,12 +253,23 @@ internal sealed class SyncingService(
         try
         {
             await remoteStorage.DeleteFileAsync(attachment);
-            if (attachment.LocalUri is not null)
-            {
-                await localStorage.DeleteFileAsync(attachment.LocalUri);
-            }
 
-            await attachmentService.WithContextAsync(ctx => ctx.DeleteAttachmentAsync(attachment.Id));
+            await attachmentService.WithContextAsync(async ctx =>
+            {
+                var current = await ctx.GetAttachmentAsync(attachment.Id);
+                if (current?.State != AttachmentState.QueuedDelete)
+                {
+                    return;
+                }
+
+                if (attachment.LocalUri is not null)
+                {
+                    await localStorage.DeleteFileAsync(attachment.LocalUri);
+                }
+
+                await ctx.DeleteAttachmentAsync(attachment.Id);
+            });
+
             return null;
         }
         catch (Exception error)
@@ -321,7 +352,7 @@ internal sealed class SyncingService(
 
                     try
                     {
-                        await RunSyncPassAsync();
+                        await RunSyncPassAsync(ct);
                     }
                     catch (OperationCanceledException)
                     {
