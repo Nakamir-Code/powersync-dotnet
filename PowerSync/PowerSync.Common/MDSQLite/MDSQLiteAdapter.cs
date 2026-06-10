@@ -248,10 +248,8 @@ public class MDSQLiteAdapter : IDBAdapter
         using (await writeMutex.LockAsync())
         {
             await fn(writeConnection);
+            writeConnection.FlushUpdates();
         }
-
-        writeConnection.FlushUpdates();
-
     }
 
     public async Task<T> WriteLock<T>(Func<ILockContext, Task<T>> fn, DBLockOptions? options = null)
@@ -262,9 +260,8 @@ public class MDSQLiteAdapter : IDBAdapter
         using (await writeMutex.LockAsync())
         {
             result = await fn(writeConnection);
+            writeConnection.FlushUpdates();
         }
-
-        writeConnection.FlushUpdates();
 
         return result;
     }
