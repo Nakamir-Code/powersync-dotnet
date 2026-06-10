@@ -2,7 +2,17 @@
 # Add a `-dev.xxx` suffix to the version. Example: `0.0.1-dev.1`
 name: Create Dev Release
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version override."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   dev-release:
@@ -29,14 +39,18 @@ jobs:
       - name: Restore dependencies
         run: dotnet restore
 
-      - name: Extract Common Package Version from CHANGELOG.md
+      - name: Extract Common Package Version
         id: extract_version
         shell: bash
         run: |
-          COMMON_VERSION=$(awk '/^## [0-9]+\.[0-9]+\.[0-9]+-dev(\.[0-9]+)?$/ {print $2; exit}' PowerSync/PowerSync.Common/CHANGELOG.md)
-          if [[ -z "$COMMON_VERSION" ]]; then
-            echo "Error: Invalid dev version found in PowerSync.Common/CHANGELOG.md. Expected format: x.x.x-dev.x"
-            exit 1
+          if [[ -n "${{ inputs.version }}" ]]; then
+            COMMON_VERSION="${{ inputs.version }}"
+          else
+            COMMON_VERSION=$(awk '/^## [0-9]+\.[0-9]+\.[0-9]+-dev(\.[0-9]+)?$/ {print $2; exit}' PowerSync/PowerSync.Common/CHANGELOG.md)
+            if [[ -z "$COMMON_VERSION" ]]; then
+              echo "Error: Invalid dev version found in PowerSync.Common/CHANGELOG.md. Expected format: x.x.x-dev.x"
+              exit 1
+            fi
           fi
           echo "Detected Version: $COMMON_VERSION"
           echo "VERSION=$COMMON_VERSION" >> $GITHUB_ENV
@@ -45,17 +59,20 @@ jobs:
         run: dotnet pack PowerSync/PowerSync.Common -c Release -o ${{ github.workspace }}/output
 
       - name: Run Push For Common
-        continue-on-error: true
-        run: dotnet nuget push ${{ github.workspace }}/output/PowerSync.Common*.nupkg --source https://api.nuget.org/v3/index.json --api-key ${{ secrets.NUGET_API_KEY }}
+        run: dotnet nuget push ${{ github.workspace }}/output/PowerSync.Common*.nupkg --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" --api-key ${{ secrets.GITHUB_TOKEN }} --skip-duplicate
 
-      - name: Extract MAUI Package Version from CHANGELOG.md
+      - name: Extract MAUI Package Version
         id: extract_maui_version
         shell: bash
         run: |
-          MAUI_VERSION=$(awk '/^## [0-9]+\.[0-9]+\.[0-9]+-dev(\.[0-9]+)?$/ {print $2; exit}' PowerSync/PowerSync.Maui/CHANGELOG.md)
-          if [[ -z "$MAUI_VERSION" ]]; then
-            echo "Error: Invalid dev version found in PowerSync.Maui/CHANGELOG.md. Expected format: x.x.x-dev.x"
-            exit 1
+          if [[ -n "${{ inputs.version }}" ]]; then
+            MAUI_VERSION="${{ inputs.version }}"
+          else
+            MAUI_VERSION=$(awk '/^## [0-9]+\.[0-9]+\.[0-9]+-dev(\.[0-9]+)?$/ {print $2; exit}' PowerSync/PowerSync.Maui/CHANGELOG.md)
+            if [[ -z "$MAUI_VERSION" ]]; then
+              echo "Error: Invalid dev version found in PowerSync.Maui/CHANGELOG.md. Expected format: x.x.x-dev.x"
+              exit 1
+            fi
           fi
           echo "Detected Version: $MAUI_VERSION"
           echo "VERSION=$MAUI_VERSION" >> $GITHUB_ENV
@@ -67,5 +84,4 @@ jobs:
         run: dotnet pack PowerSync/PowerSync.Maui -c Release -o ${{ github.workspace }}/output
 
       - name: Run Push For MAUI
-        continue-on-error: true
-        run: dotnet nuget push ${{ github.workspace }}/output/PowerSync.Maui*.nupkg --source https://api.nuget.org/v3/index.json --api-key ${{ secrets.NUGET_API_KEY }}
+        run: dotnet nuget push ${{ github.workspace }}/output/PowerSync.Maui*.nupkg --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" --api-key ${{ secrets.GITHUB_TOKEN }} --skip-duplicate
