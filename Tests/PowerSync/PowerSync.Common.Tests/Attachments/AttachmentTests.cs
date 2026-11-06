@@ -70,6 +70,11 @@ public class AttachmentTests : IAsyncLifetime
         public bool has_synced { get; set; }
     }
 
+    private sealed class CountResult
+    {
+        public long count { get; set; }
+    }
+
     [Fact(Timeout = 10000)]
     public async Task AttachmentDownload()
     {
@@ -105,6 +110,39 @@ public class AttachmentTests : IAsyncLifetime
         using var ms = new MemoryStream();
         await stream.CopyToAsync(ms);
         Assert.Equal(3, ms.Length);
+    }
+
+    [Fact(Timeout = 10000)]
+    public async Task AttachmentDownloadsRunConcurrently()
+    {
+        var mock = new MockRemoteStorage { DownloadResult = [1, 2, 3], DownloadDelay = TimeSpan.FromMilliseconds(200) };
+
+        await using var queue = new AttachmentQueue(new AttachmentQueueOptions
+        {
+            Db = _db,
+            LocalStorage = _localStorage,
+            RemoteStorage = mock,
+            WatchAttachments = ct => WatchUserPhotosAsync(_db, ct),
+            MaxConcurrentTransfers = 4,
+        });
+
+        for (var i = 0; i < 8; i++)
+        {
+            await _db.Execute(
+                "INSERT INTO users (id, name, email, photo_id) VALUES (uuid(), 'user', 'user@example.com', uuid())");
+        }
+
+        await queue.StartSyncAsync();
+
+        await TestUtils.WaitForMatchAsync(
+            ct => _db.Watch<CountResult>(
+                "SELECT COUNT(*) AS count FROM attachments WHERE state = ?",
+                [(long)AttachmentState.Synced],
+                new SQLWatchOptions { TriggerImmediately = true, Signal = ct }),
+            r => r.count == 8,
+            TimeSpan.FromSeconds(5));
+
+        Assert.InRange(mock.PeakConcurrentDownloads, 2, 4);
     }
 
     [Fact(Timeout = 10000)]
@@ -247,9 +285,14 @@ public class AttachmentTests : IAsyncLifetime
 
     private sealed class MockRemoteStorage : IRemoteStorageAdapter
     {
+        private int _activeDownloads;
+        private int _peakConcurrentDownloads;
+
         public byte[] DownloadResult { get; init; } = [];
+        public TimeSpan DownloadDelay { get; init; }
         public bool UploadCalled { get; private set; }
         public bool DeleteCalled { get; private set; }
+        public int PeakConcurrentDownloads => Volatile.Read(ref _peakConcurrentDownloads);
 
         /// <summary>
         /// Uploads a file to remote storage.
@@ -263,8 +306,25 @@ public class AttachmentTests : IAsyncLifetime
         /// <summary>
         /// Downloads a file from remote storage.
         /// </summary>
-        public Task<Stream> DownloadFileAsync(Attachment attachment) =>
-            Task.FromResult<Stream>(new MemoryStream(DownloadResult));
+        public async Task<Stream> DownloadFileAsync(Attachment attachment)
+        {
+            var active = Interlocked.Increment(ref _activeDownloads);
+            try
+            {
+                int peak;
+                while (active > (peak = Volatile.Read(ref _peakConcurrentDownloads))
+                    && Interlocked.CompareExchange(ref _peakConcurrentDownloads, active, peak) != peak)
+                {
+                }
+
+                await Task.Delay(DownloadDelay);
+                return new MemoryStream(DownloadResult);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _activeDownloads);
+            }
+        }
 
         /// <summary>
         /// Deletes a file from remote storage.

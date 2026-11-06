@@ -19,6 +19,7 @@ internal sealed class SyncingService(
     IRemoteStorageAdapter remoteStorage,
     IAttachmentErrorHandler? errorHandler,
     TimeSpan syncThrottle,
+    int maxConcurrentTransfers,
     ILogger logger)
 {
     private readonly SemaphoreSlim _startStopLock = new(1, 1);
@@ -131,38 +132,53 @@ internal sealed class SyncingService(
     }
 
     /// <summary>
-    /// Processes attachments based on their state. Each state change is persisted as soon as its
-    /// transfer completes.
+    /// Processes attachments based on their state, up to <c>maxConcurrentTransfers</c> at a time. Each
+    /// state change is persisted as soon as its transfer completes.
     /// </summary>
     /// <param name="attachments">Attachment records to process.</param>
     /// <param name="ct">The cancellation token observed between records.</param>
     /// <returns>A task that completes once all attachments have been processed.</returns>
     public async Task ProcessAttachmentsAsync(IReadOnlyList<Attachment> attachments, CancellationToken ct = default)
     {
+#if NET6_0_OR_GREATER
+        if (maxConcurrentTransfers > 1)
+        {
+            await Parallel.ForEachAsync(
+                attachments,
+                new ParallelOptions { MaxDegreeOfParallelism = maxConcurrentTransfers, CancellationToken = ct },
+                async (attachment, _) => await ProcessAttachmentAsync(attachment));
+            return;
+        }
+#endif
+
         foreach (var attachment in attachments)
         {
             ct.ThrowIfCancellationRequested();
+            await ProcessAttachmentAsync(attachment);
+        }
+    }
 
-            var snapshotState = attachment.State;
-            Attachment? changed = snapshotState switch
-            {
-                AttachmentState.QueuedUpload => await UploadAttachmentAsync(attachment),
-                AttachmentState.QueuedDownload => await DownloadAttachmentAsync(attachment),
-                AttachmentState.QueuedDelete => await DeleteAttachmentAsync(attachment),
-                _ => null,
-            };
+    private async Task ProcessAttachmentAsync(Attachment attachment)
+    {
+        var snapshotState = attachment.State;
+        Attachment? changed = snapshotState switch
+        {
+            AttachmentState.QueuedUpload => await UploadAttachmentAsync(attachment),
+            AttachmentState.QueuedDownload => await DownloadAttachmentAsync(attachment),
+            AttachmentState.QueuedDelete => await DeleteAttachmentAsync(attachment),
+            _ => null,
+        };
 
-            if (changed is not null)
+        if (changed is not null)
+        {
+            await attachmentService.WithContextAsync(async ctx =>
             {
-                await attachmentService.WithContextAsync(async ctx =>
+                var current = await ctx.GetAttachmentAsync(attachment.Id);
+                if (current?.State == snapshotState)
                 {
-                    var current = await ctx.GetAttachmentAsync(attachment.Id);
-                    if (current?.State == snapshotState)
-                    {
-                        await ctx.SaveAttachmentsAsync([changed]);
-                    }
-                });
-            }
+                    await ctx.SaveAttachmentsAsync([changed]);
+                }
+            });
         }
     }
 
