@@ -61,6 +61,7 @@ public sealed class AttachmentQueue : IAsyncDisposable
             options.RemoteStorage,
             options.ErrorHandler,
             options.SyncThrottle,
+            options.MaxConcurrentTransfers,
             _logger);
     }
 

@@ -40,6 +40,12 @@ public sealed class AttachmentQueueOptions
     /// <summary>Whether to automatically download remote attachments. Default: <c>true</c>.</summary>
     public bool DownloadAttachments { get; init; } = true;
 
+    /// <summary>
+    /// Maximum number of attachment transfers a sync pass runs at once. Default: 1.
+    /// Values above 1 apply on .NET 6 and later; netstandard2.0 always transfers one at a time.
+    /// </summary>
+    public int MaxConcurrentTransfers { get; init; } = 1;
+
     /// <summary>Maximum number of archived attachments to keep before cleanup. Default: 100.</summary>
     public int ArchivedCacheLimit { get; init; } = 100;
 
