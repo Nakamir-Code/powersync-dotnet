@@ -33,6 +33,10 @@ jobs:
       - name: Install MAUI Workloads
         run: dotnet workload restore
 
+      # The macOS runner image no longer ships the Android API 34 platform the net8.0-android targets build against.
+      - name: Install Android SDK Platform 34
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" > /dev/null
+
       - name: Download PowerSync extension
         run: dotnet run --project Tools/Setup
 
