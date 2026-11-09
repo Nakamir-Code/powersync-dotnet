@@ -1,9 +1,26 @@
 # PowerSync.Common Changelog
 
+## 0.1.5
+
+- Update the PowerSync SQLite core extension to 0.5.3.
+  - Fix a transaction affecting both insert-only and regular tables being recorded as two transaction ids.
+  - Improve error messages for errors originating from the core extension.
+- Add `PowerSyncConnectionOptions.CheckpointMode`. When set to `CheckpointMode.Requests()`, the connection manager uses a new protocol for checkpoints after crud uploads with better support for switching users.
+- Add `PowerSyncDatabase.RequestCheckpoint()`, which can be used to request sync updates explicitly and wait for those to complete.
+
+## 0.1.4
+
+- Update the PowerSync SQLite core extension to 0.5.2.
+- Fix "No iteration is active" errors when a sync iteration ends
+- (internal) Move watched query handling out of `PowerSyncDatabase` into a dedicated `WatchManager`. `Watch` and `OnChange` are now thin wrappers over it.
+
 ## 0.1.3
 
+- **Breaking:** Made `Table.Name` non-nullable (default ""). This change may affect 0% of users, but it is technically a breaking change.
 - Add support for loading custom SQLite extensions via `MDSQLiteOptions.Extensions`.
 - Fix streaming sync retry loop reconnecting with no delay after an exception, ignoring `RetryDelayMs`.
+- Lock `MDSQLiteConnection._updateBuffer` to fix a rare issue with high-frequency local writes while syncing.
+- (internal) Remove `Compiled*` classes in favor of working with `Table` and `Schema` objects directly.
 
 ## 0.1.2
 
