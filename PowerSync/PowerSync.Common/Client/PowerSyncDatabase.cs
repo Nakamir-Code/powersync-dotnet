@@ -1,18 +1,17 @@
 namespace PowerSync.Common.Client;
 
-using System.Runtime.CompilerServices;
-using System.Text.RegularExpressions;
-using System.Threading.Channels;
 using System.Threading.Tasks;
 
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 using Newtonsoft.Json;
+
 using Nito.AsyncEx;
-using ThrottleDebounce;
 
 using PowerSync.Common.Client.Connection;
+using PowerSync.Common.Client.Sync;
 using PowerSync.Common.Client.Sync.Bucket;
 using PowerSync.Common.Client.Sync.Stream;
 using PowerSync.Common.DB;
@@ -52,6 +51,12 @@ public class PowerSyncDatabaseOptions() : BasePowerSyncDatabaseOptions()
     /// If not provided, a default Remote will be created.
     /// </summary>
     public Func<IPowerSyncBackendConnector, Remote>? RemoteFactory { get; set; }
+
+    /// <summary>
+    /// Used to calculate delays for the sync client (retry delays, upload throttling).
+    /// Used for testing to avoid waiting out some long delays (retry delay is minimum 10 seconds).
+    /// </summary>
+    internal TimeProvider? TimeProvider { get; set; }
 }
 
 public class PowerSyncDBEvents : EventManager
@@ -130,10 +135,7 @@ public interface IPowerSyncDatabase : ICloseableAsync
 public class PowerSyncDatabase : IPowerSyncDatabase
 {
     public IDBAdapter Database { get; protected set; }
-    private CompiledSchema schema;
-
-    private const int DEFAULT_WATCH_THROTTLE_MS = 30;
-    private static readonly Regex POWERSYNC_TABLE_MATCH = new Regex(@"(^ps_data__|^ps_data_local__)", RegexOptions.Compiled);
+    private Schema schema;
 
     public bool Closed { get; protected set; }
     public bool Ready { get; protected set; }
@@ -144,6 +146,8 @@ public class PowerSyncDatabase : IPowerSyncDatabase
     protected ConnectionManager ConnectionManager;
 
     private readonly InternalSubscriptionManager subscriptions;
+
+    private readonly WatchManager watchManager;
 
     private StreamingSyncImplementation? syncStreamImplementation;
     public string SdkVersion { get; protected set; }
@@ -199,16 +203,19 @@ public class PowerSyncDatabase : IPowerSyncDatabase
         Closed = false;
         Ready = false;
 
-        schema = options.Schema.Compile();
+        schema = options.Schema;
         SdkVersion = "";
 
         remoteFactory = options.RemoteFactory ?? (connector => new Remote(connector));
+        var timeProvider = options.TimeProvider ?? TimeProvider.System;
+
+        watchManager = new WatchManager(this, masterCts.Token);
 
         // Start async init
         subscriptions = new InternalSubscriptionManager(
             firstStatusMatching: WaitForStatus,
             resolveOfflineSyncStatus: ResolveOfflineSyncStatus,
-            subscriptionsCommand: async (payload) => await this.WriteTransaction(async tx =>
+            subscriptionsCommand: async (payload) => await WriteTransaction(async tx =>
                 {
                     await tx.Execute("SELECT powersync_control(?, ?) AS r", ["subscriptions", JsonConvert.SerializeObject(payload)]);
                 }));
@@ -227,9 +234,17 @@ public class PowerSyncDatabase : IPowerSyncDatabase
                         await WaitForReady();
                         await connector.UploadData(this);
                     },
+                    PostCheckpointRequest = connector is ICustomCheckpointRequestConnector checkpointConnector
+                        ? async (clientId, requestId, token) =>
+                        {
+                            await WaitForReady();
+                            return await checkpointConnector.PostCheckpointRequest(clientId, requestId, token);
+                        }
+                    : null,
                     RetryDelayMs = options.RetryDelayMs,
                     Subscriptions = options.Subscriptions,
                     CrudUploadThrottleMs = options.CrudUploadThrottleMs,
+                    TimeProvider = timeProvider,
                     Logger = Logger
                 });
 
@@ -320,6 +335,7 @@ public class PowerSyncDatabase : IPowerSyncDatabase
         }
 
         var tcs = new TaskCompletionSource<bool>();
+        var canceledRegistration = cts.Token.Register(() => tcs.TrySetCanceled(cts.Token));
 
         _ = Task.Run(async () =>
         {
@@ -335,16 +351,32 @@ public class PowerSyncDatabase : IPowerSyncDatabase
                 }
             }
             catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                tcs.TrySetException(ex);
+                cts.Cancel();
+            }
         });
 
-        await tcs.Task;
+        try
+        {
+            await tcs.Task;
+        }
+        finally
+        {
+            canceledRegistration.Dispose();
+            cts.Cancel();
+        }
     }
 
     protected async Task Initialize(PowerSyncDatabaseOptions options)
     {
-        await BucketStorageAdapter.Init();
         await LoadVersion();
-        await UpdateSchema(options.Schema);
+        await Database.WriteTransaction(tx => tx.Execute("SELECT powersync_init()"));
+
+        // Note: no SchemaChangedEvent here - watched queries only resolve their source tables
+        // once initialization has completed, so the initial schema is never stale for them.
+        await ReplaceSchema(options.Schema);
         await ResolveOfflineSyncStatus();
         await Database.Execute("PRAGMA RECURSIVE_TRIGGERS=TRUE");
         Ready = true;
@@ -355,7 +387,19 @@ public class PowerSyncDatabase : IPowerSyncDatabase
 
     private async Task LoadVersion()
     {
-        string sdkVersion = (await Database.Get<VersionResult>("SELECT powersync_rs_version() as version")).version;
+        string sdkVersion;
+        try
+        {
+            sdkVersion = (await Database.Get<VersionResult>("SELECT powersync_rs_version() as version")).version;
+        }
+        catch (SqliteException ex)
+        {
+            throw new SqliteException(
+                "Ensure the PowerSync core SQLite extension is loaded.",
+                ex.SqliteErrorCode,
+                ex.SqliteExtendedErrorCode);
+        }
+
         SdkVersion = sdkVersion;
 
         int[] versionInts;
@@ -369,14 +413,14 @@ public class PowerSyncDatabase : IPowerSyncDatabase
         catch (Exception e)
         {
             throw new Exception(
-                $"Unsupported PowerSync extension version. Need >=0.4.5 <1.0.0, got: {sdkVersion}. Details: {e.Message}"
+                $"Unsupported PowerSync extension version. Need >=0.5.2 <0.6.0, got: {sdkVersion}. Details: {e.Message}"
             );
         }
 
-        // Validate version is >= 0.4.5 and < 1.0.0
-        if (versionInts[0] != 0 || versionInts[1] < 4 || (versionInts[1] == 4 && versionInts[2] < 5))
+        // Validate version is >= 0.5.2 and < 0.6.0
+        if (versionInts[0] != 0 || versionInts[1] != 5 || versionInts[2] < 2)
         {
-            throw new Exception($"Unsupported PowerSync extension version. Need >=0.4.5 <1.0.0, got: {sdkVersion}");
+            throw new Exception($"Unsupported PowerSync extension version. Need >=0.5.2 <0.6.0, got: {sdkVersion}");
         }
     }
 
@@ -402,25 +446,30 @@ public class PowerSyncDatabase : IPowerSyncDatabase
     /// </summary>
     public async Task UpdateSchema(Schema schema)
     {
-        CompiledSchema compiledSchema = schema.Compile();
         if (syncStreamImplementation != null)
         {
             throw new Exception("Cannot update schema while connected");
         }
 
+        await ReplaceSchema(schema);
+        Events.Emit(new PowerSyncDBEvents.SchemaChangedEvent(schema));
+    }
+
+    private async Task ReplaceSchema(Schema schema)
+    {
         try
         {
-            compiledSchema.Validate();
+            schema.Validate();
         }
         catch (Exception ex)
         {
             Logger.LogWarning("Schema validation failed. Unexpected behavior could occur: {Exception}", ex);
         }
 
-        this.schema = compiledSchema;
-        await Database.Execute("SELECT powersync_replace_schema(?)", [compiledSchema.ToJSON()]);
+        this.schema = schema;
+        await Database.WriteTransaction(tx =>
+            tx.Execute("SELECT powersync_replace_schema(?)", [JsonConvert.SerializeObject(schema)]));
         await Database.RefreshSchema();
-        Events.Emit(new PowerSyncDBEvents.SchemaChangedEvent(schema));
     }
 
     /// <summary>
@@ -430,16 +479,6 @@ public class PowerSyncDatabase : IPowerSyncDatabase
     public async Task Init()
     {
         await WaitForReady();
-    }
-
-    private RequiredAdditionalConnectionOptions resolveConnectionOptions(PowerSyncConnectionOptions? options)
-    {
-        var defaults = RequiredAdditionalConnectionOptions.DEFAULT_ADDITIONAL_CONNECTION_OPTIONS;
-        return new RequiredAdditionalConnectionOptions
-        {
-            RetryDelayMs = options?.RetryDelayMs ?? defaults.RetryDelayMs,
-            CrudUploadThrottleMs = options?.CrudUploadThrottleMs ?? defaults.CrudUploadThrottleMs,
-        };
     }
 
     public async Task Connect(IPowerSyncBackendConnector connector, PowerSyncConnectionOptions? options = null)
@@ -485,6 +524,41 @@ public class PowerSyncDatabase : IPowerSyncDatabase
         // The data has been deleted - reset the sync status
         CurrentStatus = new SyncStatus(new SyncStatusOptions());
         Events.Emit(new PowerSyncDBEvents.StatusChangedEvent(CurrentStatus));
+    }
+
+    /// <summary>
+    /// Requests a checkpoint from the PowerSync service.
+    ///
+    /// The returned request can be awaited using <see cref="CheckpointRequest.WaitForSync" />
+    /// to confirm that the local database has applied server-side changes up to
+    /// the checkpoint. This method requires an active or connecting sync client
+    /// connected with <see cref="CheckpointMode.Requests()" /> and PowerSync service version
+    /// 1.24.0 or later.
+    /// </summary>
+    /// <exception cref="CheckpointRequestException">
+    /// Thrown when requesting the checkpoint has failed, for example when the
+    /// database is disconnected.
+    /// </exception>
+    public async Task<CheckpointRequest> RequestCheckpoint(CancellationToken ct = default)
+    {
+        await WaitForReady();
+
+        // Important: `LockAsync(CancellationToken)` will still take the lock even if
+        // cancellation is requested, so long as the token is canceled before LockAsync
+        // is called and the lock is not in use; i.e. an already-canceled token will only
+        // prevent _waiting_ for the lock, not getting the lock. Therefore, we need to
+        // check for cancellation ourselves before entering the using block.
+        ct.ThrowIfCancellationRequested();
+        using (await runExclusive.LockAsync(ct))
+        {
+            var sync = SyncStreamImplementation;
+            if (sync == null)
+            {
+                throw new CheckpointRequestException(CheckpointRequestException.Disconnected);
+            }
+
+            return await sync.RequestCheckpoint(this, ct);
+        }
     }
 
     /// <summary>
@@ -650,29 +724,9 @@ public class PowerSyncDatabase : IPowerSyncDatabase
         });
     }
 
-    public async Task HandleCrudCheckpoint(long lastClientId, string? writeCheckpoint = null)
+    public Task HandleCrudCheckpoint(long lastClientId, string? writeCheckpoint = null)
     {
-        await Database.WriteTransaction(async (tx) =>
-        {
-            await tx.Execute($"DELETE FROM {PSInternalTable.CRUD} WHERE id <= ?", [lastClientId]);
-            if (!string.IsNullOrEmpty(writeCheckpoint))
-            {
-                var check = await tx.GetAll<object>($"SELECT 1 FROM {PSInternalTable.CRUD} LIMIT 1");
-                if (check.Length == 0)
-                {
-
-                    await tx.Execute($"UPDATE {PSInternalTable.BUCKETS} SET target_op = CAST(? as INTEGER) WHERE name='$local'", [
-                      writeCheckpoint
-                    ]);
-                }
-            }
-            else
-            {
-                await tx.Execute(
-                    $"UPDATE {PSInternalTable.BUCKETS} SET target_op = CAST(? as INTEGER) WHERE name = '$local'",
-                    [BucketStorageAdapter.GetMaxOpId()]);
-            }
-        });
+        return BucketStorageAdapter.HandleCrudCheckpoint(lastClientId, writeCheckpoint);
     }
 
     /// <summary>
@@ -769,192 +823,24 @@ public class PowerSyncDatabase : IPowerSyncDatabase
         return await Database.WriteTransaction(fn, options);
     }
 
+    /// <summary>
+    /// Executes a read query every time the source tables are modified.
+    ///
+    /// The query's source tables are resolved automatically (or taken from
+    /// <see cref="SQLWatchOptions.Tables"/> when provided), and are re-resolved whenever the
+    /// schema changes, so watches keep working across <see cref="UpdateSchema"/> calls.
+    /// </summary>
+    public IAsyncEnumerable<T[]> Watch<T>(string sql, object?[]? parameters = null, SQLWatchOptions? options = null)
+    {
+        return watchManager.Watch<T>(sql, parameters, options);
+    }
+
+    /// <summary>
+    /// Emits an event whenever any of the tables in <see cref="SQLWatchOptions.Tables"/> are modified.
+    /// </summary>
     public IAsyncEnumerable<WatchOnChangeEvent> OnChange(SQLWatchOptions? options = null)
     {
-        options ??= new SQLWatchOptions();
-
-        var tables = options?.Tables ?? [];
-        var powersyncTables = new HashSet<string>(
-            tables.SelectMany(table => new[] { $"ps_data__{table}", $"ps_data_local__{table}" })
-        );
-
-        var signal = options?.Signal != null
-            ? CancellationTokenSource.CreateLinkedTokenSource(masterCts.Token, options.Signal.Value)
-            : CancellationTokenSource.CreateLinkedTokenSource(masterCts.Token);
-
-        var listener = Database.Events.OnTablesUpdated.ListenAsync(signal.Token);
-
-        // Return the actual IAsyncEnumerable here, using OnChange as a synchronous wrapper that blocks until the
-        // connection is established
-        var throttleMs = options?.ThrottleMs ?? DEFAULT_WATCH_THROTTLE_MS;
-        return OnChangeCore(powersyncTables, listener, signal, options?.TriggerImmediately == true, throttleMs);
-    }
-
-    private async IAsyncEnumerable<WatchOnChangeEvent> OnChangeCore(
-        HashSet<string> watchedTables,
-        IAsyncEnumerable<DBAdapterEvents.TablesUpdatedEvent> listener,
-        CancellationTokenSource signal,
-        bool triggerImmediately,
-        int throttleMs = DEFAULT_WATCH_THROTTLE_MS
-    )
-    {
-        try
-        {
-            await foreach (var update in OnRawTableChange(watchedTables, listener, signal.Token, triggerImmediately, throttleMs))
-            {
-                // Convert from 'ps_data__<name>' to '<name>'
-                for (int i = 0; i < update.ChangedTables.Length; i++)
-                {
-                    update.ChangedTables[i] = InternalToFriendlyTableName(update.ChangedTables[i]);
-                }
-                yield return update;
-            }
-        }
-        finally
-        {
-            signal.Dispose();
-        }
-    }
-
-    private static string InternalToFriendlyTableName(string internalName)
-    {
-        const string PS_DATA_PREFIX = "ps_data__";
-        const string PS_DATA_LOCAL_PREFIX = "ps_data_local__";
-
-        if (internalName.StartsWith(PS_DATA_PREFIX))
-            return internalName.Substring(PS_DATA_PREFIX.Length);
-
-        if (internalName.StartsWith(PS_DATA_LOCAL_PREFIX))
-            return internalName.Substring(PS_DATA_LOCAL_PREFIX.Length);
-
-        return internalName;
-    }
-
-    public IAsyncEnumerable<T[]> Watch<T>(
-        string sql,
-        object?[]? parameters = null,
-        SQLWatchOptions? options = null
-    )
-    {
-        options ??= new SQLWatchOptions();
-
-        // Stop watching on master CTS cancellation, or on user CTS cancellation
-        var signal = options.Signal != null
-            ? CancellationTokenSource.CreateLinkedTokenSource(masterCts.Token, options.Signal.Value)
-            : CancellationTokenSource.CreateLinkedTokenSource(masterCts.Token);
-
-        // Establish the initial DB listener synchronously before returning the IAsyncEnumerable,
-        // so that table changes between Watch() being called and iteration starting are not missed.
-        // This mirrors the pattern used in OnChange().
-        var initialRestartCts = CancellationTokenSource.CreateLinkedTokenSource(signal.Token);
-        var initialListener = Database.Events.OnTablesUpdated.ListenAsync(initialRestartCts.Token);
-
-        return WatchCore<T>(sql, parameters, options, signal, initialRestartCts, initialListener);
-    }
-
-    private async IAsyncEnumerable<T[]> WatchCore<T>(
-        string sql,
-        object?[]? parameters,
-        SQLWatchOptions options,
-        CancellationTokenSource signal,
-        CancellationTokenSource initialRestartCts,
-        IAsyncEnumerable<DBAdapterEvents.TablesUpdatedEvent> initialListener
-    )
-    {
-        var schemaChanged = new TaskCompletionSource<bool>();
-
-        // Listen for schema changes in the background
-        var schemaListenerTask = Task.Run(async () =>
-        {
-            await foreach (var update in Events.OnSchemaChanged.ListenAsync(signal.Token))
-            {
-                // Swap schemaChanged with an unresolved TCS
-                var oldTcs = Interlocked.Exchange(ref schemaChanged, new());
-                oldTcs.TrySetResult(true);
-            }
-        }, signal.Token);
-
-        // Re-register query on schema updates
-        bool isRestart = false;
-        var currentRestartCts = initialRestartCts;
-        var currentListener = initialListener;
-        var throttleMs = options?.ThrottleMs ?? DEFAULT_WATCH_THROTTLE_MS;
-
-        try
-        {
-            while (!signal.Token.IsCancellationRequested)
-            {
-                // Resolve tables
-                HashSet<string> powersyncTables;
-                if (options?.Tables != null)
-                {
-                    powersyncTables = [.. options
-                        .Tables
-                        .SelectMany<string, string>(table => [$"ps_data__{table}", $"ps_data_local__{table}"]
-                    )];
-                }
-                else
-                {
-                    powersyncTables = await GetSourceTables(sql, parameters);
-                }
-
-                var enumerator = OnRawTableChange(
-                    powersyncTables,
-                    currentListener,
-                    currentRestartCts.Token,
-                    isRestart || (options?.TriggerImmediately == true),
-                    throttleMs
-                ).GetAsyncEnumerator();
-
-                // Continually wait for either OnChange or SchemaChanged to fire
-                while (true)
-                {
-                    var currentSchemaTask = schemaChanged.Task;
-                    var onChangeTask = enumerator.MoveNextAsync().AsTask();
-                    var completedTask = await Task.WhenAny(onChangeTask, currentSchemaTask);
-
-                    if (completedTask == currentSchemaTask)
-                    {
-                        var oldRestartCts = currentRestartCts;
-                        oldRestartCts.Cancel();
-                        isRestart = true;
-                        // Let the current task complete/cancel gracefully
-                        try { await onChangeTask; }
-                        catch (OperationCanceledException) { }
-
-                        // Establish a new listener BEFORE resolving source tables in the next iteration,
-                        // so that changes during the async GetSourceTables call are not missed.
-                        currentRestartCts = CancellationTokenSource.CreateLinkedTokenSource(signal.Token);
-                        currentListener = Database.Events.OnTablesUpdated.ListenAsync(currentRestartCts.Token);
-                        oldRestartCts.Dispose();
-
-                        break;
-                    }
-
-                    // Await onChangeTask to propagate cancellation and detect end-of-enumeration
-                    bool hasNext;
-                    try { hasNext = await onChangeTask; }
-                    catch (OperationCanceledException) { yield break; }
-
-                    if (!hasNext) break;
-
-                    var update = enumerator.Current;
-                    if (update.ChangedTables != null)
-                    {
-                        yield return await GetAll<T>(sql, parameters);
-                    }
-                }
-            }
-        }
-        finally
-        {
-            signal.Cancel();
-            try { await schemaListenerTask; }
-            catch (OperationCanceledException) { }
-
-            currentRestartCts.Dispose();
-            signal.Dispose();
-        }
+        return watchManager.OnChange(options);
     }
 
     private class ExplainedResult
@@ -986,112 +872,6 @@ public class PowerSyncDatabase : IPowerSyncDatabase
 
         return [.. tables.Select(row => row.tbl_name)];
     }
-
-    private async IAsyncEnumerable<WatchOnChangeEvent> OnRawTableChange(
-        HashSet<string> watchedTables,
-        IAsyncEnumerable<DBAdapterEvents.TablesUpdatedEvent> listener,
-        [EnumeratorCancellation] CancellationToken signal,
-        bool triggerImmediately = false,
-        int throttleMs = DEFAULT_WATCH_THROTTLE_MS
-    )
-    {
-        if (triggerImmediately)
-        {
-            yield return new WatchOnChangeEvent { ChangedTables = [] };
-        }
-
-        if (throttleMs <= 0)
-        {
-            // No throttling
-            HashSet<string> changedTables = new();
-            await foreach (var e in listener)
-            {
-                GetTablesFromNotification(e.TablesUpdated, changedTables);
-                changedTables.IntersectWith(watchedTables);
-                if (changedTables.Count == 0) continue;
-                yield return new WatchOnChangeEvent { ChangedTables = [.. changedTables] };
-            }
-            yield break;
-        }
-
-        // Throttled - publish via throttled call to an action that flushes accumulated changes into this channel
-        var channel = Channel.CreateUnbounded<WatchOnChangeEvent>();
-        var accumulatedTables = new HashSet<string>();
-
-        _ = Task.Run(async () =>
-        {
-            using var throttledFlush = Throttler.Throttle(() =>
-                {
-                    // Safe to lock directly on accumulatedTables because it's a local variable
-                    lock (accumulatedTables)
-                    {
-                        if (accumulatedTables.Count == 0) return;
-                        channel.Writer.TryWrite(new WatchOnChangeEvent { ChangedTables = [.. accumulatedTables] });
-                        accumulatedTables.Clear();
-                    }
-                },
-                TimeSpan.FromMilliseconds(throttleMs),
-                leading: false,
-                trailing: true
-            );
-
-            try
-            {
-                var changedTables = new HashSet<string>();
-                await foreach (var e in listener)
-                {
-                    GetTablesFromNotification(e.TablesUpdated, changedTables);
-                    changedTables.IntersectWith(watchedTables);
-                    if (changedTables.Count == 0) continue;
-
-                    lock (accumulatedTables) { accumulatedTables.UnionWith(changedTables); }
-                    throttledFlush.Invoke();
-                }
-            }
-            catch (OperationCanceledException) { }
-            finally
-            {
-                // Flush any remaining events and close the channel
-                lock (accumulatedTables)
-                {
-                    if (accumulatedTables.Count > 0)
-                    {
-                        channel.Writer.TryWrite(new WatchOnChangeEvent { ChangedTables = [.. accumulatedTables] });
-                        accumulatedTables.Clear();
-                    }
-                }
-                channel.Writer.Complete();
-            }
-        });
-
-        // Continuously pull values from channel and publish to the consumer
-        while (await channel.Reader.WaitToReadAsync(CancellationToken.None))
-        {
-            while (channel.Reader.TryRead(out var evt))
-            {
-                yield return evt;
-            }
-        }
-    }
-
-    private static void GetTablesFromNotification(INotification updateNotification, HashSet<string> changedTables)
-    {
-        changedTables.Clear();
-        string[] tables = [];
-        if (updateNotification is BatchedUpdateNotification batchedUpdate)
-        {
-            tables = batchedUpdate.Tables;
-        }
-        else if (updateNotification is UpdateNotification singleUpdate)
-        {
-            tables = [singleUpdate.Table];
-        }
-
-        foreach (var table in tables)
-        {
-            changedTables.Add(table);
-        }
-    }
 }
 
 public class SQLWatchOptions
@@ -1104,6 +884,9 @@ public class SQLWatchOptions
     /// </summary>
     public int? ThrottleMs { get; set; }
 
+    /// <summary>
+    /// If true, runs the query once when creating the watch. Defaults to false.
+    /// </summary>
     public bool TriggerImmediately { get; set; } = false;
 }
 
