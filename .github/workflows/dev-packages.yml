@@ -28,14 +28,10 @@ jobs:
       - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "8.0.x"
+          dotnet-version: "10.0.x"
 
-      - name: Install MAUI Workloads
+      - name: Install native workloads
         run: dotnet workload restore
-
-      # The macOS runner image no longer ships the Android API 34 platform the net8.0-android targets build against.
-      - name: Install Android SDK Platform 34
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" > /dev/null
 
       - name: Download PowerSync extension
         run: dotnet run --project Tools/Setup
@@ -50,9 +46,9 @@ jobs:
           if [[ -n "${{ inputs.version }}" ]]; then
             COMMON_VERSION="${{ inputs.version }}"
           else
-            COMMON_VERSION=$(awk '/^## [0-9]+\.[0-9]+\.[0-9]+-dev(\.[0-9]+)?$/ {print $2; exit}' PowerSync/PowerSync.Common/CHANGELOG.md)
+            COMMON_VERSION=$(awk '/^## [0-9]+\.[0-9]+\.[0-9]+-(alpha|beta|dev|rc)(\.[0-9]+)?$/ {print $2; exit}' PowerSync/PowerSync.Common/CHANGELOG.md)
             if [[ -z "$COMMON_VERSION" ]]; then
-              echo "Error: Invalid dev version found in PowerSync.Common/CHANGELOG.md. Expected format: x.x.x-dev.x"
+              echo "Error: Invalid dev version found in PowerSync.Common/CHANGELOG.md. Expected format: x.x.x-<dev-suffix>.x"
               exit 1
             fi
           fi
@@ -64,28 +60,3 @@ jobs:
 
       - name: Run Push For Common
         run: dotnet nuget push ${{ github.workspace }}/output/PowerSync.Common*.nupkg --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" --api-key ${{ secrets.GITHUB_TOKEN }} --skip-duplicate
-
-      - name: Extract MAUI Package Version
-        id: extract_maui_version
-        shell: bash
-        run: |
-          if [[ -n "${{ inputs.version }}" ]]; then
-            MAUI_VERSION="${{ inputs.version }}"
-          else
-            MAUI_VERSION=$(awk '/^## [0-9]+\.[0-9]+\.[0-9]+-dev(\.[0-9]+)?$/ {print $2; exit}' PowerSync/PowerSync.Maui/CHANGELOG.md)
-            if [[ -z "$MAUI_VERSION" ]]; then
-              echo "Error: Invalid dev version found in PowerSync.Maui/CHANGELOG.md. Expected format: x.x.x-dev.x"
-              exit 1
-            fi
-          fi
-          echo "Detected Version: $MAUI_VERSION"
-          echo "VERSION=$MAUI_VERSION" >> $GITHUB_ENV
-
-      - name: Build MAUI Project
-        run: dotnet build PowerSync/PowerSync.Maui -c Release
-
-      - name: Run Pack For MAUI
-        run: dotnet pack PowerSync/PowerSync.Maui -c Release -o ${{ github.workspace }}/output
-
-      - name: Run Push For MAUI
-        run: dotnet nuget push ${{ github.workspace }}/output/PowerSync.Maui*.nupkg --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" --api-key ${{ secrets.GITHUB_TOKEN }} --skip-duplicate
